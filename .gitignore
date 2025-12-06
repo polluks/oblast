@@ -1,0 +1,13 @@
+_bak
+_bak/*
+test
+test/*
+_omedia
+_omedia/*
+*.arc
+*.sym
+*.h
+*.tok
+*.prg
+ddtank.*
+

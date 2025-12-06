@@ -1,0 +1,49 @@
+0000
+	(low memory, stack, etc)
+0340
+	temporary space for menu sprites
+0400
+	(screen matrix)
+0800
+	BASIC shell (0800-0bff also double buffer location for credits routine)
+1f00
+	game low portion
+2800
+	gameplay font
+2a00
+	gameplay sprites
+3680 (13952)
+	util routines and jump table, continued at $9500
+3800
+	menu font
+4000
+	theme/credit music
+4c00
+	champion music for HI-5
+5800
+	champion screen matrix for HI-5
+5c00
+	hi-res colour matrix 1
+6000
+	hi-res screen 1
+	56576,6: 53272,120: 53265,59
+8000
+	hi-res colour matrix 2
+8400
+	champion colour matrix for HI-5
+8800
+	game end music
+9400
+	saved processor stack for HI-5
+9500
+	game mid portion and "hi-5" champion raster display
+a000
+	hi-res screen 2
+	56576,5: 53272,8: 53265,59
+c000
+	game high portion and credits text
+d000
+	i/o
+e000
+	Kernal (e000-e3ff: backing store for 0400/0800 screen pages)
+ffff

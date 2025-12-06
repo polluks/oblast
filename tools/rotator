@@ -1,0 +1,95 @@
+#!/usr/bin/perl -s
+
+# after Chris Zamara, Transactor volume 5 issue 1
+
+$cx ||= 12;
+$cy ||= 11;
+$n ||= 12; # 0-30-60-90-120-150-180 ... 300-330
+
+# starting line number
+$line ||= 5000;
+
+# emit byt statements or data statements
+$byt ||= 0; # data statements
+
+$count = 0;
+$scount = 0;
+
+sub template { ($byt) ? ".byt " : "$line data "; }
+
+# read input (data or .byt)
+while(<>) {
+	chomp; chomp;
+	s/^.byt\s+//i;
+	s/^\d+\s+data\s+//i;
+	push(@mem, map { 0+$_} split(/,/, $_));
+}
+
+push(@mem, 0) if (scalar(@mem) == 63);
+die("got @{[ scalar(@mem) ]} bytes, expected 64\n")
+	if (scalar(@mem) != 64);
+
+$rtate = -2 * 3.1415926 / $n;
+$angle = $rtate;
+$baddr = 0;
+$page = 0;
+@e = (128, 64, 32, 16, 8, 4, 2, 1);
+
+for($i=1;$i<$n;$i++) {
+	$addr = $baddr;
+
+	for($y0=0;$y0<21;$y0++) {
+		$x0 = 0;
+
+		for($col=0;$col<3;$col++) {
+			for($bit=0;$bit<8;$bit++) {
+				if ($mem[$addr] & $e[$bit]) {
+					$x = $cx-$x0;
+					$y = $cy-$y0;
+					$x2 = $x*cos($angle)-$y*sin($angle);
+					$y2 = $x*sin($angle)+$y*cos($angle);
+					# 505
+					$x2 = int($x2 + $cx + 0.5);
+					$y2 = int($cy - $y2 + 0.5);
+					if ($x2<24 && $y2<21 &&
+							$x2>=0 && $y2>=0) {
+						$cl = int($x2/8);
+						$bt = $e[$x2 & 7];
+						$a2 = ($page + 1)*64+$cl
+							+($y2*3);
+						die("illegal address $a2\n")
+							if ($a2 > 16383);
+						$mem[$a2] |= $bt;
+					}
+				}
+				$x0++;
+			}
+			$addr++;
+		}
+	}
+
+	$angle += $rtate;
+	$page++;
+}
+die("assertion: i == n but $i != $n\n") if ($i != $n);
+
+for($i=0;$i<$n;$i++) {
+	$bline = &template;
+	$base = $i*64;
+	for($j=0;$j<64;$j++) {
+		$byte = 0+$mem[$base+$j];
+		if ((length($bline)+length(",$byte"))>78) {
+			$bline =~ s/,$//;
+			print STDOUT "$bline\n";
+			$line += 10;
+			$bline = &template;
+		}
+		$bline .= "$byte,";
+	}
+	if ($bline ne &template) {
+		$bline =~ s/,$//;
+		print STDOUT "$bline\n";
+		$line += 10;
+	}
+}
+

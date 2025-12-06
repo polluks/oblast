@@ -1,0 +1,3069 @@
+;
+; main assembly code for Oblast
+; (C)2025 Cameron Kaiser. All rights reserved.
+; Freeware under the Floodgap Free Software License.
+;
+; visit oldvcr.blogspot.com
+
+#define SEG(x)	.assert *<=x,"overrun":.dsb(x-*):.assert *=x,"oops"
+
+	.word $1f00
+	* = $1f00
+
+;;; utility and master control routines start at $3680/13952 ;;;
+
+;;; typical game modes ;;;
+; seedp=whatever
+; for the default "regular duty"
+; denziti=166 triziti=32 trails=0 burner=40 glastnk=1 fastbul=0
+; for the sharpshooter "precision munitions"
+; denziti=180 triziti=32 trails=0 burner=40 glastnk=1 fastbul=0
+; for the adventurous "hazard pay"
+; denziti=144 triziti=40 trails=0 burner=40 glastnk=1 fastbul=0
+; for the nostalgic "more like classic blasto"
+; denziti=176 triziti=96 trails=3 burner=40 glastnk=1 fastbul=1
+; for the maniac "blow everything up fast"
+; denziti=100 triziti=32 trails=0 burner=10 glastnk=0 fastbul=1
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; parameters for procedural level generation
+; seed data pointer, advance by 16 for each level
+; uses BASIC ROM
+seedp	.word $a800					; + 0, 1
+; bomb density is a value (higher, fewer bombs)
+; useful(?) values between 100 and 200
+; 100 is ridiculous
+; 128 is very high density
+; 144 is high density
+; 160 is medium density
+; 180 is low density
+; 200 is very low density
+denziti	.byt 100					; + 2
+; tree density is a value (higher, more trees)
+triziti	.byt 32						; + 3
+; trails configuration
+; 1 = horizontal trails
+; 2 = vertical trails
+; 3 = both
+; 0 = none
+trails	.byt 0						; + 4
+
+; parameters for gameplay
+; fuel burn rate, in 4-ticks
+burner	.byt 10						; + 5
+; tank penalty? (1 = yes)
+glastnk	.byt 0						; + 6
+; return bullet on collision like old blasto? (1 = yes)
+fastbul	.byt 1						; + 7
+
+; have we configured this before? (0 = no, default, 32 = yes)
+; used by title sequence, 32 is the value directly used for prompt flasher
+preconf	.byt 0						; + 8
+
+; score block
+; bombs exploded count (16-bit)
+bomscor	.word 0						; + 9, 10
+; one each for each bonus type (8-bit)
+; must match BONUSES below
+bonuses	.byt 0, 0, 0, 0, 0, 0, 0			; + 11...17
+; display indicator for current level, populated by BASIC
+levsegs	.byt 0, 0, 0					; + 18, 19, 20
+
+	.assert (* = $1f15), "BASIC will be very confused"
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; convenience to get sprite pointer (also used for assertions below)
+#define SPR(x)	((x & 16383) / 64)
+; sprites go here
+gamfonb	= 10240			; i.e., $2800
+sprbase	= gamfonb+512		; skip first 64 characters, in EBC mode
+mainfon	= gamfonb+4096
+; location of screen and colour memory
+where	= $0400
+	.assert (where < $4000 && sprbase < $4000), "not in same VIC bank"
+colour	= $d800
+; eight bytes of pointer data
+lozp	= $57
+; other zp pointer
+otzp	= $9e
+
+boombit	= 128
+; needed for bit
+defbit	.byt boombit
+
+; obstacles at rest
+; DO NOT SET DEFERRED BITS
+; unactivated bomb
+; should NOT MATCH any valid sprite pointer value (see counter routine)
+bombz	= 28
+	.assert bombz>0, "must be non-zero"
+	.assert bombz<64, "clashes with background"
+	.assert bombz<SPR(sprbase), "matches sprite pointer"
+; trees
+; should NOT MATCH any valid sprite pointer value (see counter routine)
+tree	= 30
+tree2	= 38
+	.assert tree>0, "must be non-zero"
+	.assert tree2>0, "must be non-zero"
+	.assert tree<64, "clashes with background"
+	.assert tree2<64, "clashes with background"
+	.assert tree<SPR(sprbase), "matches sprite pointer"
+	.assert tree2<SPR(sprbase), "matches sprite pointer"
+; phases of an activated bomb
+; set during explosion
+; use memory locations so we can index stages
+boomz1	= 27
+boomz2	= 29
+	.assert boomz1<64, "clashes with background"
+	.assert boomz1<SPR(sprbase), "matches sprite pointer"
+	.assert boomz2<64, "clashes with background"
+	.assert boomz2<SPR(sprbase), "matches sprite pointer"
+; boomz	.byt boomz1,boomz2
+
+; other characters can have deferred bits set
+; 32 and 192 and above are ignored by the explosion routine
+
+; no state here
+nuthin	= 32
+
+; walls
+; use different background
+panelbit=192
+wall	= (0  | panelbit)
+	.assert wall & panelbit, "must be in tier 3"
+ppanel	= (32 | panelbit)
+
+; panel
+; x coordinate of panel elements
+panelxc	= 35
+; location of level indicator
+levellr	= 4
+levell	= (levellr*40)+panelxc+1
+; bullet character (for showing available fire chambers)
+; this is part of the panel, so it should match the wall background
+bulletc	= (31 | panelbit)
+	.assert bulletc & panelbit, "must be in tier 3"
+; location of chamber indicator
+bulletr	= levellr+2
+bulletl	= (bulletr*40)+panelxc
+; fuel gauge character (for drawing strip)
+fuelc	= (37 | panelbit)
+fuelec	= (5 | panelbit)
+fuelfc	= (6 | panelbit)
+	.assert fuelc & panelbit, "must be in tier 3"
+	.assert fuelec & panelbit, "must be in tier 3"
+	.assert fuelfc & panelbit, "must be in tier 3"
+; position in characters of top of fuel gauge (used to position gauge sprite)
+fuellr	= (bulletr+2)
+fuellc	= panelxc
+	.assert fuellc > 31, "must be located in panel"
+; location of fuel gauge (where the fuel F indicator goes)
+fuell	= ((fuellr*40)+fuellc)
+; starting point for each colour
+fuelh1	= fuell+2
+fuelh1h	= 4*40
+fuelh2	= fuell+2+fuelh1h
+fuelh2h	= 5*40
+fuelh3	= fuell+2+(fuelh1h+fuelh2h)
+fuelh3h	= 4*40
+; location of empty gauge
+fuelel	= fuell+(fuelh1h+fuelh2h+fuelh3h-40)
+; fuel count (basically lines)
+fuelout	= (fuelh1h+fuelh2h+fuelh3h)/5
+
+; locations of DEMO indicators (when in demo mode)
+demollr	= levellr-2
+demoll	= (demollr*40)+panelxc
+demokk	= fuelel+80
+
+; other byte reservations at the end
+; sprite usage
+; sprite 0 is the fuel gauge needle
+; sprite 1,2,3 is the tank plus shadows and hilights
+; sprite 4,5,6,7 are the shells-bullets
+
+; starting location of tank sprite
+tankx	= 144
+tanky	= 138
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; after initialization with initd, initc or initz (in $c000 range)
+; construct a game screen from seed data
+
+nuscrn	; wipe interstitial area just in case so counts are right
+	ldy #0
+	lda #nuthin
+wipei	sta where+1000,y
+	iny
+	cpy #16
+	bne wipei
+
+	; set pointers to seed range
+	lda seedp
+	sta lozp
+	sta lozp+2
+	sta lozp+4
+	sta lozp+6
+	ldx seedp+1
+	stx lozp+1
+	inx
+	stx lozp+3
+	inx
+	stx lozp+5
+	inx
+	stx lozp+7
+
+	; draw
+	; if seed >= denziti, it's a bomb
+	; else if seed & triziti != 0, it's empty
+	; else it's a tree
+#define WENDER(seed,out,col) .( :\
+	lda (seed),y:tax:	\
+	cmp denziti:	\
+	bcs dobomb:	\
+	cmp triziti:	\
+	bcs empty:	\
+	dotree: txa:ldx #tree:and #1:bne *+4:ldx #tree2:txa: \
+	sta out,y:	\
+	lda #13:	\
+	sta col,y:	\
+	jmp dun:	\
+	dobomb: lda #bombz:	\
+	sta out,y:	\
+	lda #0:		\
+	sta col,y:	\
+	jmp dun:	\
+	empty: lda #nuthin: \
+	sta out,y:	\
+	dun: .)
+	
+	ldy #0
+nulup
+	WENDER(lozp,  where+0,  colour+0)
+	WENDER(lozp+2,where+256,colour+256)
+	WENDER(lozp+4,where+512,colour+512)
+	WENDER(lozp+6,where+744,colour+744)
+	iny
+	beq dunlup
+	jmp nulup
+dunlup
+
+	; draw top and bottom borders
+	ldy #39
+linea	lda #wall
+	sta where,y
+	sta where+960,y
+	lda #0
+	sta colour,y
+	sta colour+960,y
+	dey
+	bpl linea
+
+	; draw side borders (do as 30-40)
+	; column 30 is a wall character, the rest are panels for animation
+	ldy #39
+lineb	lda #ppanel
+linebb	sta where,y
+	sta where+40,y
+	sta where+80,y
+	sta where+120,y
+	sta where+160,y
+	sta where+200,y
+	sta where+240,y
+	sta where+280,y
+	sta where+320,y
+	sta where+360,y
+	sta where+400,y
+	sta where+440,y
+	sta where+480,y
+	sta where+520,y
+	sta where+560,y
+	sta where+600,y
+	sta where+640,y
+	sta where+680,y
+	sta where+720,y
+	sta where+760,y
+	sta where+800,y
+	sta where+840,y
+	sta where+880,y
+	sta where+920,y
+	sta where+960,y
+	lda #0
+	sta colour,y
+	sta colour+40,y
+	sta colour+80,y
+	sta colour+120,y
+	sta colour+160,y
+	sta colour+200,y
+	sta colour+240,y
+	sta colour+280,y
+	sta colour+320,y
+	sta colour+360,y
+	sta colour+400,y
+	sta colour+440,y
+	sta colour+480,y
+	sta colour+520,y
+	sta colour+560,y
+	sta colour+600,y
+	sta colour+640,y
+	sta colour+680,y
+	sta colour+720,y
+	sta colour+760,y
+	sta colour+800,y
+	sta colour+840,y
+	sta colour+880,y
+	sta colour+920,y
+	sta colour+960,y
+	dey
+	cpy #30
+	beq dunwall
+	cpy #31
+	beq dunpan
+	jmp lineb
+dunpan	lda #wall
+	jmp linebb
+dunwall
+
+	; clear space for the tank
+	lda #nuthin
+	sta where+((tankx-24)/8)+(40*((tanky-50)/8))
+	sta where+((tankx-24)/8)+(40*((tanky-50)/8))+1
+	sta where+((tankx-24)/8)+(40*((tanky-50)/8))+2
+	sta where+((tankx-24)/8)+(40*((tanky-50)/8))+40
+	sta where+((tankx-24)/8)+(40*((tanky-50)/8))+41
+	sta where+((tankx-24)/8)+(40*((tanky-50)/8))+42
+	sta where+((tankx-24)/8)+(40*((tanky-50)/8))+80
+	sta where+((tankx-24)/8)+(40*((tanky-50)/8))+81
+	sta where+((tankx-24)/8)+(40*((tanky-50)/8))+82
+
+	; clear out corners, tank may not be able to enter
+	sta where+40
+	sta where+70
+	sta where+920
+	sta where+950
+
+	; clear trails, if any
+	; horizontal
+	lda trails
+	and #1
+	bne *+5
+	jmp trailv
+	; side h trails
+	ldy #0
+	lda #nuthin
+	tax
+trailhl	sta where+(4*40),y
+	sta where+(5*40),y
+	sta where+(6*40),y
+	sta where+(18*40),y
+	sta where+(19*40),y
+	sta where+(20*40),y
+	iny
+	cpy #7
+	bcc trailhl
+	beq *+4
+	bcs trailhs
+	tya
+	clc
+	adc #15
+	tay
+	txa
+	bne trailhl		; "bra"
+trailhs	cpy #31
+	bne trailhl
+	; centre h trail
+	ldy #9
+trailhm	sta where+(11*40),y
+	sta where+(12*40),y
+	sta where+(13*40),y
+	iny
+	cpy #22
+	bne trailhm
+
+	; vertical
+trailv	lda trails
+	and #2
+	bne *+5
+	jmp countbt
+
+; starting row
+vtrlsr	= 4
+	lda #<(where+40*vtrlsr)
+	sta $fb
+	lda #>(where+40*vtrlsr)
+	sta $fc
+	ldx #vtrlsr
+#define DO_3(w) \
+	ldy #w:sta ($fb),y:iny:sta ($fb),y:iny:sta ($fb),y
+trailvl	lda #nuthin
+	DO_3(6)
+	DO_3(15)
+	DO_3(22)
+	lda $fb
+	clc
+	adc #40
+	sta $fb
+	lda $fc
+	adc #0
+	sta $fc
+	inx
+	cpx #21
+	bne trailvl
+
+countbt	; count bombs and trees
+	; can't do this during WENDER because we'll overwrite part
+	; of it with the walls
+	lda #0
+	sta totbom
+	sta tottree
+	sta totbom+1
+	sta tottree+1
+
+#define COUNTER(where) .( : \
+	ldx #0: \
+	cloop: \
+		lda where,x :\
+		cmp #bombz :\
+		beq bombz1 : \
+		cmp #tree :\
+		beq treez1: \
+		cmp #tree2: \
+		bne cloopt :\
+	treez1: \
+		inc tottree :\
+		bne *+5 :\
+		inc tottree+1 :\
+		jmp cloopt :\
+	bombz1: \
+		inc totbom :\
+		bne *+5 :\
+		inc totbom+1 :\
+	cloopt: \
+		inx :\
+		bne cloop :\
+	.)
+	COUNTER(where)
+	COUNTER(where+256)
+	COUNTER(where+512)
+	; make sure sprite pointers don't match
+	COUNTER(where+768)
+
+	; negate totbom and tottree so that we can just add to count
+	; during the explosion loop
+	sec
+	lda #0
+	sbc totbom
+	sta totbom
+	lda #0
+	sbc totbom+1
+	sta totbom+1
+	sec
+	lda #0
+	sbc tottree
+	sta tottree
+	lda #0
+	sbc tottree+1
+	sta tottree+1
+
+; enter game main loop
+
+	; prep for gameplay
+	lda #200	; reset X scroll
+	sta 53270
+	; background colours shall be
+	; colour 0 - green (most of the screen)
+	lda #5
+	sta 53281
+	; colour 1 - not used, leave white
+	lda #1
+	sta 53282
+	; colour 2 - yellow (deferred bit, enhance explosions)
+	lda #7
+	sta 53283
+	; colour 3 - black (walls and status panel)
+	lda #0
+	sta 53284
+
+	; draw demo indicators
+	lda tkinpuu
+	cmp #$60
+	beq :+
+	lda #(4 | panelbit)
+	sta where+demoll
+	sta where+demokk
+	lda #(39 | panelbit)
+	sta where+demoll+3
+	sta where+demokk+3
+	lda #(58 | panelbit)
+	sta where+demoll+1
+	sta where+demokk+1
+	lda #(59 | panelbit)
+	sta where+demoll+2
+	sta where+demokk+2
+	lda #7
+	sta colour+demoll
+	sta colour+demokk
+	sta colour+demoll+1
+	sta colour+demokk+1
+	sta colour+demoll+2
+	sta colour+demokk+2
+	sta colour+demoll+3
+	sta colour+demokk+3
+:
+
+	; draw level indicators
+	ldx #0
+levdraw	lda levsegs,x
+	clc
+	adc #48
+	ora #panelbit
+	sta where+levell,x
+	lda #2
+	sta colour+levell,x
+	inx
+	cpx #3
+	bne levdraw
+
+	; draw chamber indicators
+	lda #bulletc
+	sta where+bulletl
+	sta where+bulletl+1
+	sta where+bulletl+2
+	sta where+bulletl+3
+	lda #3
+	sta colour+bulletl
+	sta colour+bulletl+1
+	sta colour+bulletl+2
+	sta colour+bulletl+3
+
+	; draw fuel gauge
+	; "F"
+	lda #fuelfc
+	sta where+fuell
+	lda #1
+	sta colour+fuell
+	; "E"
+	sta colour+fuelel
+	lda #fuelec
+	sta where+fuelel
+#define STRIPE(c,p,h) .( : \
+		ldy #0: \
+	lup:	lda #fuelc:sta where+p,y: \
+		lda #c:sta colour+p,y: \
+		tya:clc:adc #40:tay:cpy #h:bne lup:\
+	.)
+	; green stripe
+	STRIPE(5,fuelh1,fuelh1h)
+	; yellow stripe
+	STRIPE(7,fuelh2,fuelh2h)
+	; red stripe
+	STRIPE(2,fuelh3,fuelh3h)
+	; position gauge needle on X
+	lda #((24+10+(8*fuellc))&255)
+	sta 53248
+	lda #1
+	sta 53264
+	; make orange
+	lda #8
+	sta 53287
+	; set shape
+	lda #SPR(spr_gauge)
+	sta where+1016
+
+	; screen on
+	lda #27+64	; extended background colour mode, reset Y scroll
+	sta 53265
+	ldx #0
+setsafl	lda 53250,x
+	sta tanksaf,x
+	inx
+	cpx #6
+	bne setsafl
+
+	; overdrive Timer A interrupt in the same fashion as IOINIT
+	; (see Kernal code at $fddd)
+SP_PAL	= ($4025 / 4)
+SP_NTSC	= ($4295 / 4)
+	sei
+	lda $02a6
+	beq spntsc
+	lda #<SP_PAL
+	sta $dc04
+	lda #>SP_PAL
+	jmp spnpall
+spntsc	lda #<SP_NTSC
+	sta $dc04
+	lda #>SP_NTSC
+spnpall	sta $dc05
+	cli
+
+	; end scene when all bombs detonated COMPLETELY
+again	inc boomsiz
+	lda didboom
+	bne againn
+	lda #0
+	sta boomsiz
+	lda totbom
+	ora totbom+1
+	bne againn	; bomb count is still non zero, keep going
+againj	jmp nagain	; end scene
+
+	; handle objects
+	; bullets animate on 1 tick
+	; tank moves on 2 ticks
+	; bombs explode on 4 ticks
+	; timer goes down every 240 ticks (because we're at 240 fps)
+againn	lda #0
+	sta 162
+againl	; check exit keys
+	; probably could just do this once ...
+	lda 653
+	cmp #7
+	beq jexitg
+
+	lda 162
+	beq againl
+	jsr shells
+	
+againm	
+/*
+	lda 653
+	cmp #7
+	beq jexitg
+*/
+
+	lda 162
+	cmp #2
+	bcc againm
+	jsr shells
+	; update sprite safe zone
+	jsr tankcol
+	jsr tank
+
+againo	
+/*
+	lda 653
+	cmp #7
+	beq jexitg
+*/
+
+	lda 162
+	cmp #3
+	bcc againo
+	jsr shells
+
+againp	
+/*
+	lda 653
+	cmp #7
+	beq jexitg
+*/
+
+	lda 162
+	cmp #4
+	bcc againp
+	jsr shells
+	; update sprite safe zone
+	jsr tankcol
+	jsr tank
+
+	; update fuel use
+	dec burnrat
+	bne noburn
+	inc 53249
+	lda burner
+	sta burnrat
+	lda 53249
+	cmp #(50-1+(fuellr*8)+fuelout)
+	bcc noburn
+jexitg	jmp exitg
+noburn
+
+	; gate off any explosion sound playing
+	lda didboom
+	beq *+7
+	lda #128
+	sta 54290
+	; use current amplitude of explosion to mask random value
+	; this will shake the screen synchronized to the audio
+	lda 54300
+	lsr		; scale amplitude down to 0-7
+	lsr
+	lsr
+	lsr
+	lsr		; now occupies lowest three bits
+	; if boomsize is less than a critical value, divide down again
+	; so that small explosions yield smaller shakes, but not if we're
+	; in penalty
+	ldy tankill
+	bne bigshak
+	ldy boomsiz
+	cpy #4
+	bcs bigshak
+	lsr
+	lsr		; now basically 0 or 1
+bigshak	and 54299
+	ora #200
+	sta 53270
+	
+	; fall thru to ...
+
+; main explosion routine
+
+explohd	lda #0
+	sta 162
+	sta didboom
+
+	ldy #41
+	lda #<(where-41)
+	sta $fb
+	lda #>(where-41)
+	sta $fc
+	lda #<(colour-41)
+	sta $fd
+	lda #>(colour-41)
+	sta $fe
+
+evalup	lda ($fb),y
+	cmp #panelbit
+	bcc *+5
+	jmp evalnx
+	cmp #nuthin
+	bne *+5
+	jmp evalnx
+
+	; strip deferred bit off characters we hit
+	bit defbit
+	beq eboomz1
+	eor #boombit
+	cmp #boomz1
+	beq eboomz0	; deferred activated bombs still explode
+	sta ($fb),y
+	jmp evalnx
+
+	; do explosions in this order
+
+	; terminal boom
+eboomz1	cmp #boomz2
+	bne eboomz0
+	lda #nuthin
+	sta ($fb),y
+	lda #8
+	sta ($fd),y
+	sty didboom
+	jmp evalnx
+
+	; triggered bomb
+eboomz0	cmp #boomz1
+	beq doboom
+	jmp evalnx
+	; everything but bombs and walls becomes a terminal boom
+	; bombs around it become triggered
+	; changes in the next row have deferred bit on so we don't change them
+doboom	lda #boomz2
+	sta ($fb),y
+	lda #7
+	sta ($fd),y
+	; warble explosion frequency for ear interest
+	lda 54299
+	ora #128	; keep it in audible range
+	sta 54286
+	; make sure explosion voice is on if not already
+	lda didboom
+	bne *+7
+	lda #129
+	sta 54290
+
+	; handle 8 characters around it at 0,1,2,40,(all def)42,80,81,82
+	; mask bit 6 off of the explosions so they don't become walls
+#define BOOM(yv,hbv)	.( :\
+	ldy #yv:	\
+	lda ($fb),y:	\
+	bit defbit:	\
+	bne skip:	\
+	cmp #wall:	\
+	beq skip:	\
+	cmp #boomz1:	\
+	beq skip:	\
+	cmp #bombz:	\
+	beq isbomb:	\
+	cmp #tree:	\
+	beq istree:	\
+	cmp #tree2:	\
+	bne nottree:	\
+	istree:	\
+		inc tottree:	\
+		bne *+5:	\
+		inc tottree+1:	\
+	nottree: \
+		lda #8:		\
+		sta ($fd),y:	\
+		lda #boomz2:	\
+		jmp dun:	\
+	isbomb:	\
+		inc totbom:bne *+5:inc totbom+1: \
+		inc bomscor:bne *+5:inc bomscor+1: \
+		lda #boomz1: \
+	dun: ora #hbv:	\
+	     sta ($fb),y:\
+	skip: .)
+	
+//#define DEBUG 1
+#ifdef DEBUG
+#define PAWS	lda #0:sta 162:lda 162:cmp #60:bcc *-4
+#else
+#define PAWS	;
+#endif
+
+BOOM(0, 0)
+PAWS
+BOOM(1, 0)
+PAWS
+BOOM(2, 0)
+PAWS
+BOOM(40,0)
+PAWS
+BOOM(42,boombit)
+PAWS
+BOOM(80,boombit)
+PAWS
+BOOM(81,boombit)
+PAWS
+BOOM(82,boombit)
+PAWS
+
+	; Y must be 41 leaving this routine! it's our next starting offset!
+	ldy #41
+	sty didboom
+
+enboomz	; did we trigger a tank explosion?
+	lda glastnk
+	bne *+5
+	jmp evalnx	; tank is invulnerable
+	lda 53279
+	sta holdcol
+	and #14
+	bne *+5
+	jmp evalnx
+
+	; maybe!
+	; if we're stuck on an uninvolved character, then we could falsely
+	; be colliding. don't check our centre; check the seven characters
+	; around it. remember, we're centered in the sprite shape.
+	; use the routine from COLLIE() below, but we need to use a different
+	; zero page address.
+collzp 	= $8b
+		lda #0:sta collzp+3: \
+		lda 53250: \
+		sec:sbc #(24-11):lsr:lsr:lsr: \
+		tax: \
+		lda 53251: \
+		sec:sbc #(50-10):lsr:lsr:lsr:sta collzp+2:\
+		asl:asl:clc:adc collzp+2: \
+		sta collzp+2: \
+		asl collzp+2:rol collzp+3: \
+		asl collzp+2:rol collzp+3: \
+		asl collzp+2:rol collzp+3: \
+		clc:txa:adc collzp+2:sta collzp: \
+		lda collzp+3:adc #>where:sta collzp+1: \
+		lda collzp:sec:sbc #41:sta collzp: \
+		lda collzp+1:sbc #0:sta collzp+1
+#define CHECK(x) \
+	ldy #x:lda (collzp),y:cmp #boomz1:beq enbootz:cmp #boomz2:beq enbootz
+
+enboock
+	CHECK(0)
+	CHECK(1)
+	CHECK(2)
+	CHECK(40)
+	CHECK(42)
+	CHECK(80)
+	CHECK(81)
+	CHECK(82)
+
+	; collision wasn't with the explosion, so ignore it
+	ldy #41		; Y needs to be reset
+	jmp evalnx
+
+	; yes, we tripped on the explosion, nail the tank and play audio
+enbootz	lda #2
+	sta 53280
+	lda #40
+	sta tankill
+	sta penlev
+	lda #133	; ring mod with voice 3
+	sta 54276
+	ldy #41		; Y needs to be reset
+
+evalnx	inc $fb
+	bne *+4
+	inc $fc
+
+	inc $fd
+	bne *+4
+	inc $fe
+
+	lda $fb
+	cmp #<(where+960-41)
+	beq *+5
+	jmp evalup
+	lda $fc
+	cmp #>(where+960-41)
+	beq evaldun
+	jmp evalup
+	
+evaldun
+	jmp again
+
+end_lobank	;
+
+	SEG(gamfonb)
+	.assert (* & 2047)=0, "game font is not aligned"
+; make sure to skip starting address
+; only need first 64 shapes since we're in EBM
+.bin 2,512,"game.fon"
+	.assert (*=sprbase), "game font must be exactly 512 bytes"
+	.assert (* & 63)=0, "sprites are not aligned"
+; non-rotators (63 bytes each)
+; shell
+spr_shell
+#include "shell.h"
+.byt 0
+spr_gauge
+#include "gauge.h"
+.byt 0
+; rotators (each are 12 frames, 64 bytes each)
+; tank tread
+spr_tread
+#include "tank1.h"
+; tank tread 2
+spr_tread2
+#include "tank1a.h"
+; tank turret
+spr_turret
+#include "tank2.h"
+; tank base
+spr_base
+#include "tank3.h"
+end_sprites	;
+	.assert (* & 63)=0, "sprites are not aligned"
+	.assert (*=$3680), "BASIC will be very confused"
+
+;;; jump table for utility and main routines ;;;
+
+	jmp title		; sys 13952	+ 0
+	jmp musoff		; sys 13955	+ 3
+	jmp menuha		; sys 13958	+ 6
+cold	jmp initz		; sys 13961	+ 9
+warm	jmp initc		; sys 13964	+ 12
+	jmp muson1		; sys 13967	+ 15
+	jmp muson2		; sys 13970	+ 18
+	jmp muson4		; sys 13973	+ 21
+	jmp hi5			; sys 13976	+ 24
+	jmp highh		; sys 13979	+ 27
+	jmp configh		; sys 13982	+ 30
+	jmp ditdith		; sys 13985	+ 33
+	jmp ditdits		; sys 13988	+ 36
+	jmp credits		; sys 13991	+ 39
+
+	; user-wait routine for BASIC when displaying end-of-game summary
+	; + 42
+	/* poke 785,170:poke 786,54:w=64:w=usr(w) */
+usrw	jsr $b1aa		; FAC1 -> lb in y, hb in a
+	lda #0
+	sta 162
+usrwl	cpy 162
+	beq usrwq
+	lda 56320		; check for button
+	and #16
+	bne usrwl
+usrww	lda 56320		; debounce button
+	and #16
+	beq usrww
+	ldy #0
+usrwq	lda #0
+	jmp ($0005)		; lb in y, hb in a -> FAC
+
+	; assumes that 0 to the colour memory erases the prompt
+#define ROWDRAW(l1, base) l1 .( :\
+	ldx #0: \
+l2	tya:sta base,x: \
+	tya:and preconf:sta base+960,x: \
+	inx:cpx #40:bne l2:rts: .)
+	
+	ROWDRAW(ttrow0, $5c00)
+	ROWDRAW(ttrow1, $8000)
+
+	; play that funky music, off-white computer
+mustick	.byt 0
+musirq	; for consistency with VT editor, skip every sixth cycle to
+	; approximate PAL speeds, even with Timer A
+	;lda $02a6
+	;bne musirqc
+	inc mustick
+	lda mustick
+	cmp #6
+	bcc musirqc
+	lda #0
+	sta mustick
+	jmp $ea31
+	; ass-U-me that the music routine is starting on a page boundary
+musirqc	jsr $0003
+	jmp $ea31
+
+musoff	sei
+	lda #$31
+	sta $0314
+	lda #$ea
+	sta $0315
+sidoff	lda #9		; gate and whack oscillator
+	sta 54276
+	sta 54283
+	sta 54290
+	lda #0
+	sta 54272
+	sta 54273
+	sta 54279
+	sta 54280
+	sta 54286
+	sta 54287
+	sta 54296
+	cli
+	rts
+
+	; champion track is played by the hi-5 routine
+	; valkyries track (fast and slow)
+muson1	lda #1:sta $4035
+muson1c	jsr $4000:lda #$40:jmp musonc
+muson2	lda #4:sta $4035:jmp muson1c
+	; game over track
+muson4	jsr $8800:lda #$88
+musonc	sta musirqc+2:lda #0:sta mustick
+	sei
+	lda #<musirq
+	sta $0314
+	lda #>musirq
+	sta $0315
+	cli
+	rts
+
+	; jiffies off and on for each blink phase
+	; used for all routines that blink text
+ttixof	= 6
+ttixon	= 50
+	; line for menu helper
+mhscol	= 7
+mhspos0	= 55296
+mhspos1	= 55296+800
+menuc	.byt mhscol
+menuw	.byt 0
+menuh	ldx #ttixof
+	lda menuc
+	beq menuh0
+	ldx #ttixon
+menuh0	stx menuw
+	ldx #0
+	stx 162
+menuhl	sta mhspos0,x
+	sta mhspos1,x
+	inx
+	cpx #40
+	bne menuhl
+menuhm	lda 162
+	cmp menuw
+	bcc menuhc
+	lda menuc
+	eor #mhscol
+	sta menuc
+	jmp menuh
+menuhc	jsr $ffe4
+	cmp #13
+	bcc menuhm
+	beq menudn
+	cmp #67
+	bcc menuhm
+	beq menudn
+	cmp #72
+	bcc menuhm
+	beq menudn
+	cmp #133
+	bcc menuhm
+	cmp #137
+	bcs menuhm
+menudn	sta 2
+	rts
+	; enter at midpoint from title screen
+menuha	lda #ttixon
+	sta menuw
+	lda #ttixof
+	sta 162
+	ldx #0
+	lda menuc
+	jmp menuhl
+
+	; continued at $9400
+	
+	SEG(mainfon)
+; make sure to skip starting address
+.bin 2,0,"main.fon"
+	.assert *<16385, "assets are too big for 16K VIC bank"
+
+;;; all remaining resources except the high bitmap at $a000 ;;;
+
+	SEG($4000)
+valkmu	.bin 2,0,"valk.mus"
+	SEG($4c00)
+champmu	.bin 2,0,"champ.mus"
+	SEG($5800)
+champs	.bin 2,0,"champ.scr"
+	SEG($5c00)
+.bin 2,0,"ddtitle"
+	SEG($8000)
+.bin 2,0,"ddtank.scr"
+	SEG($8400)
+champc	.bin 2,0,"champ.col"
+	SEG($8800)
+.bin 2,0,"endgame.mus"
+	SEG($9400)
+stacksv	; stack save location for hi5
+	SEG($9500)
+
+	; extra code that didn't fit goes here
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; setup sound
+; tested on 6581 and 8580
+; this is called once on game start so that we have continuous sound
+; as we move level to level
+
+isound	ldx #0
+	lda #0
+sidcl	sta 54272,x
+	inx
+	cpx #19
+	bne sidcl
+	; voice 1
+	; tank gun and tank explosion
+	lda #128
+	sta 54272
+	lda #11
+	sta 54277
+	lda #128
+	sta 54276
+	; voice 2
+	; tank motion, with frequencies for idle, movement and rotation
+idlef	= 96
+movef	= 255
+turnf	= 192
+	lda #idlef
+	sta 54279
+	lda #64
+	sta 54285
+	; voice 3
+	; explosions, frequency is randomized
+	; voice 3 is fed back to itself and used for screen effects,
+	; so the explosions MUST be on voice 3
+	lda #112
+	sta 54286
+	lda #15
+	sta 54291
+	lda #12
+	sta 54292
+	lda #128
+	sta 54290
+	; low pass filter c/resonance
+	; then volume up, filter on tank motion, gate on tank motion
+	lda #3
+	sta 54294
+	lda #242
+	sta 54295
+	lda #31
+	sta 54296
+	lda #129
+	sta 54283
+	rts
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; title sequence
+
+tscr	.byt 0
+tscrc	.byt 0
+tscrfc	.byt 0
+	; blink cycles per screen
+tscrcm	= 6
+	; colour to use for the blinking text
+ttscol	= 32
+	; number of screen flips before we go to demo
+ttdemon	= 3
+title	; display title screens, flash appropriate prompts in red, show demo
+	jsr musoff
+	jsr muson1
+	lda #$60
+	sta tkinpuu		; set game to playthru default
+	lda #ttdemon
+	sta tscrfc
+	lda #0
+	sta 162
+	sta 53280
+	sta 53281
+	sta tscr
+titlel	; enters with jiffy clock zeroed!
+	; 127^4 = 123 (f1 pressed)
+	; 111^4 = 107 (both pressed)
+	; 111^64 = 47 (fire pressed)
+	; 127^64 = 63 (neither pressed)
+#define CHECKJK .( : lda 56320:eor 203: \
+		cmp #123:bne c1:jmp titled:c1 cmp #47:bne c2:jmp titled:c2: .)
+	; start with screen off for blink-off jiffies
+	; then prompts on for blink-on jiffies, off for blink-off
+	; repeat for total count, end on blink on for blink-on jiffies
+#define	TITLES(u0, v1, v2) .( : \
+	lda #tscrcm:sta tscrc:\
+l0	lda 53265:bpl l0: \
+	lda #11:sta 53265: \
+	lda #v1:sta 56576:lda #v2:sta 53272: \
+l1	CHECKJK:lda 162:cmp #ttixof:bcc l1:\
+l2	lda 53265:bpl l2: \
+	lda #59:sta 53265: \
+	lda #0:sta 162:ldy #ttscol:jsr u0: \
+l3	CHECKJK:lda 162:cmp #ttixon:bcc l3: \
+	lda #0:sta 162:ldy #0:jsr u0:dec tscrc:bne l1: \
+	.)
+
+	TITLES(ttrow0, 6, 120)
+	TITLES(ttrow1, 5, 8)
+	dec tscrfc
+	bne :+
+	jsr initd
+	jmp uninitd		; returns to title
+:	jmp titlel
+	; exit back to BASIC menu
+titled	sta 2			; for BASIC to examine
+:	lda 53265
+	bpl :-
+	lda #11
+	sta 53265
+titled2	lda 203
+	cmp #64
+	bne titled2
+	lda 56320
+	cmp #127
+	bne titled2
+	rts
+
+	; champion light show high-five routine
+hi5	lda #0
+	sta 53280
+	sta 53281
+	sta 53282
+	sta 53283
+	lda #147
+	jsr $ffd2
+	lda #12
+	sta 53284
+	lda #11
+	sta 53265
+	; wait until raster is offscreen
+:	lda 53265
+	bpl :-
+	lda #27			; use game.fon
+	sta 53272
+
+	jsr champmu
+
+	; zero frame counter for scroller
+	lda #0
+	sta counter
+	sta counter+1
+	; prime music
+	jsr champmu+3
+
+	sei
+	; save entire stack at this point or we won't be able to
+	; properly return to BASIC
+	tsx
+	stx oldsp
+	ldx #0
+sstacks	lda $0100,x
+	sta stacksv,x
+	inx
+	bne sstacks
+
+	lda #6
+	sta mustick
+	lda #201
+	sta ufldpos		; screen starts below border
+
+	lda #<fldmirq
+	ldx #>fldmirq
+	sta 788
+	stx 789
+
+        lda #$01
+        ldy #$2c
+        sta $d01a
+        sty $d012
+	lda #$7f
+	sta $dc0d
+	; only IRQ now is the raster IRQ
+	cli
+
+	; wait one frame to ensure we caught the raster
+	lda counter
+:	cmp counter
+	beq :-
+
+	; copy over screen now that the screen is off screen
+	ldx #0
+initcpy	lda champs,x
+	sta $0400,x
+	lda champc,x
+	sta $d800,x
+	lda champs+256,x
+	sta $0500,x
+	lda champc+256,x
+	sta $d900,x
+	lda champs+512,x
+	sta $0600,x
+	lda champc+512,x
+	sta $da00,x
+	lda champs+768,x
+	sta $0700,x
+	lda champc+768,x
+	sta $db00,x
+	inx
+	bne initcpy
+
+	; scroll medal into position using FLD
+#if(0)
+/* this was an effect that didn't come out the way I wanted it to */
+	ldy #0
+	ldx #15
+greybar
+	lda greyz,y
+	sta 53282
+	lda greyz,x
+	sta 53283
+	iny
+	tya
+	and #15
+	tay
+	dex
+	txa
+	and #15
+	tax
+#else
+	lda #2
+	sta 53282
+	lda #6
+	sta 53283
+greybar
+#endif
+
+	; wait minimum one frame before scrolling
+wacal1	lda 56320
+	and #16
+	beq wacal3x		; button pressed
+	lda counter
+wacal2	cmp counter
+	beq wacal2
+	and #3
+	; and every other frame
+	cmp #0
+	beq wacal1
+	cmp #2
+	beq wacal1
+	; cycle greybar every other frame
+	; advance shield on every fourth frame
+	cmp #3
+	bne *+5
+	dec ufldpos
+	bne greybar	; works in both cases
+
+	; at top of screen, but wait one frame just in case we jumped early
+wacal3x	lda #0
+	sta ufldpos
+	lda counter
+wacal3	cmp counter
+	beq wacal3
+
+	; shield in position, switch IRQs
+	; set up double raster ping-pong between lines 130 and 225
+	sei
+	lda #0
+	sta $d01a
+	sta whichi
+	sta rbarde
+	lda #$7f
+	sta $dc0d
+	lda #<pingirq
+	ldx #>pingirq
+	sta $0314
+	stx $0315
+	lda #91
+	sta 53265
+	lda #130
+	sta 53266
+	lda #1
+	sta $d01a
+	clc
+	cli
+	bcc *		; wait for first raster IRQ with new routine
+
+whichi	.byte 0
+rbarde	.byte 0
+
+	; raster controller
+	; never actually return from an interrupt!
+pingirq	ldx #255	; ensure stack doesn't overflow, system reacts poorly
+	txs
+	inc $d019	; ack IRQ
+	lda whichi
+	eor #1
+;sta $d020
+	sta whichi
+	bne irq2
+
+	; 130-225 draws medal raster bars
+irq1	lda #225
+	sta 53266
+	lda #91
+	sta 53265
+	; vary starting value to animate
+	lda rbarde	; every other time
+	eor #1
+	sta rbarde
+	beq sval
+	inc sval+1
+	lda sval+1
+	cmp #(redz-bluz)
+	bne sval
+	lda #0
+	sta sval+1
+	; starting value here
+sval	ldy #0
+	cli			; ok to interrupt
+	; run until we are interrupted
+dodo	lda 56320
+	and #16
+	beq hi5end
+dodod	lda redz,y
+	sta 53282
+	lda bluz,y
+	sta 53283
+	ldx #39
+:	dex
+	bne :-
+	iny
+	cpy #(redz-bluz)
+	bne dodo
+	ldy #0
+	jmp dodo
+
+	; 225-130 plays music
+irq2	lda #130
+	sta 53266
+	lda #91
+	sta 53265
+;lda #15
+;sta $d021
+	lda 678
+	bne domusp
+	inc mustick
+	lda mustick
+	cmp #6
+	bcc domusp
+	lda #0
+	sta mustick
+	jmp exitir
+domusp	jsr champmu+3
+exitir
+;lda #0
+;sta $d021
+	clc
+	cli			; wait for next IRQ
+	bcc *
+
+hi5end	; unwind everything
+	sei
+	lda #$00
+	sta $d01a
+	lda #$31
+	sta 788
+	lda #$ea
+	sta 789
+	lda #$ff
+	sta $dc0d
+	lda #91
+	sta 53265
+	; bring back previous stack so we can exit safely
+	ldx #0
+endstro	lda stacksv,x
+	sta $0100,x
+	inx
+	bne endstro
+	ldx oldsp
+	txs
+	cli
+	jmp sidoff
+
+;lda #0
+;ldx #0
+;offml	sta 54272,x
+;inx
+;cpx #25
+;bne offml
+;rts
+
+	; FLD and music IRQ (only while scrolling the medal in)
+fldmirq	lda ufldpos
+	cmp #3
+	bcc exitmur
+
+	; first, fld
+infldi  tax
+        ldy $d012
+infldim tya
+
+        sec
+        sbc #$02
+
+        and #$07
+        ora #80
+        sta $d011
+	; caught $d011. now we can do other things
+	lda ufldpos
+	cmp #7
+	bcs *+10
+	lda $d011
+	ora #$08	; use $38 as the base for < 7
+	sta $d011
+infldiw cpy $d012
+        beq infldiw
+        iny
+        dex
+        bne infldim
+infldiv lda $d012
+        bne infldiv
+exitmur lda #91
+	sta 53265
+
+	; next music
+	; pal or ntsc?
+fxitmur	lda 678
+	bne exitmus
+	inc mustick
+	lda mustick
+	cmp #6
+	bcc exitmus
+	lda #0
+	sta mustick
+	jmp exitrzt
+exitmus	jsr champmu+3
+exitrzt	inc $d019
+	inc counter
+	bne *+5
+	inc counter+1
+	lda $dc0d
+	jmp $ea31
+
+ufldpos	.byt 201
+; counts number of elapsed "frames"; used for sync
+counter	.word 0
+oldsp	.byt 0
+; fader tables for raster bar animation
+bluz	.byt 6,14,3,1,3,14,6
+redz	.byt 2,8,10,1,10,8,2
+#if(0)
+; see greybar, a nice idea that didn't really work out
+greyz	.byt 0,0,0,0,11,11,11,11,12,12,12,12,15,15,15,15
+#endif
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; when done with level or game
+
+nagain	; done with level
+	; award BONUSES for scoring
+
+	; crater in one - end level with one shot
+	lda tankfyr
+	cmp #2
+	bcs :+
+	inc bonuses
+:
+
+	; one tree hill - end level with only one tree left
+	lda tottree
+	cmp tottree+1
+	bne :+
+	cmp #$ff		; one left
+	bne :+
+	inc bonuses+1
+:
+
+	; complete deadwood - end level with no trees left
+	lda tottree
+	ora tottree+1
+	bne :+
+	inc bonuses+2
+:
+
+	; trigger happy - end level with all chambers depleted
+	lda bullett
+	beq :+
+	lda bullett+1
+	beq :+
+	lda bullett+2
+	beq :+
+	lda bullett+3
+	beq :+
+	inc bonuses+3
+:
+
+	; cheap shot - end level with all chambers loaded
+	; only applies if fast bullets is not on
+	lda fastbul
+	bne :+		; fast bullets are on
+	lda bullett
+	ora bullett+1
+	ora bullett+2
+	ora bullett+3
+	bne :+
+	inc bonuses+4
+:
+
+	; last two bonuses only apply if tank is vulnerable
+	lda glastnk 
+	beq nextlev	; disabled because tank is invulnerable
+	; safe driver - end level without wrecking any tanks
+	lda penlev
+	bne :+
+	inc bonuses+5
+:
+	; saved by the bell - end level in penalty
+	lda tankill
+	beq :+
+	inc bonuses+6
+:
+	
+nextlev	; continue to next level
+	; increment cosmetic indicator
+	; I will be very impressed if anyone rolls this (>999)
+	inc levsegs+2
+	lda levsegs+2
+	cmp #10
+	bcc dunlevi
+	lda #0
+	sta levsegs+2
+	inc levsegs+1
+	lda levsegs+1
+	cmp #10
+	bcc dunlevi
+	lda #0
+	sta levsegs+1
+	inc levsegs
+dunlevi
+
+	; increment seed pointer
+	lda seedp
+	clc
+	adc #16
+	sta seedp
+	lda seedp+1
+	adc #0
+	sta seedp+1
+	jmp initc		; keep sound on
+	
+	; exit game
+	; reset X scroll, Y scroll and Timer A, tank back to idle
+exitg	lda #200
+	sta 53270
+	lda #27+64
+	sta 53265
+	lda #idlef
+	sta 54279
+SP_PAL2	= $4025
+SP_NTSC2= $4295
+	sei
+	lda $02a6
+	beq spntsc2
+	lda #<SP_PAL2
+	sta $dc04
+	lda #>SP_PAL2
+	jmp spnpal2
+spntsc2	lda #<SP_NTSC2
+	sta $dc04
+	lda #>SP_NTSC2
+spnpal2	sta $dc05
+	cli
+	lda #0
+	sta 53269
+	; return to BASIC
+	rts
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; subroutines for updating shells and tank
+
+	; update shells and timeouts
+shells	
+	; check for collision
+	; account for the fact that the bullet shell is in the MIDDLE
+	; of the sprite (i.e., 24-11, 50-10)
+	lda holdcol
+	and #14		; don't mess up the tank's bits
+	ora 53279
+	sta holdcol
+
+-collzp	= $fb
+#define COLLIE(spr) .( : \
+	lda bullett+spr-4: \
+	beq *+5: \
+	dec bullett+spr-4: \
+	lda holdcol: \
+	and #(1<<spr): \
+	beq nocol: \
+	lda 53269: \
+	and #(1<<spr): \
+	beq nocol: \
+		lda #0:sta collzp+3: \
+		lda 53248+spr+spr: \
+		sec:sbc #(24-11):lsr:lsr:lsr: \
+		tax: \
+		lda 53249+spr+spr: \
+		sec:sbc #(50-10):lsr:lsr:lsr:sta collzp+2:\
+		asl:asl:clc:adc collzp+2: \
+		sta collzp+2: \
+		asl collzp+2:rol collzp+3: \
+		asl collzp+2:rol collzp+3: \
+		asl collzp+2:rol collzp+3: \
+		clc:txa:adc collzp+2:sta collzp: \
+		lda collzp+3:adc #>where:sta collzp+1: \
+		ldy #0:lda (collzp),y: \
+		cmp #bombz:bne nobomb: \
+	bomb: \
+		inc bomscor:bne *+5:inc bomscor+1: \
+		inc totbom:bne *+5:inc totbom+1: \
+		lda #boomz1:sta ($fb),y: \
+		jmp killit: \
+	nobomb: \
+		cmp #tree:beq *+6: \
+		cmp #tree2:bne nocol: \
+		inc tottree:bne *+5:inc tottree+1: \
+		lda #boomz2:sta ($fb),y: \
+		jmp killit: \
+	nocol: \
+		lda 53248+spr+spr:clc:adc bulletx+spr-4:sta 53248+spr+spr: \
+		cmp #(24-8-11):bcc killit: \
+		lda 53249+spr+spr:clc:adc bullety+spr-4:sta 53249+spr+spr: \
+		cmp #(250-8-10):bcs killit:cmp #(50+8-10):bcc killit: \
+		jmp endcol: \
+	killit: \
+		lda 53269:and #(255 ^ (1<<spr)):sta 53269: \
+		lda fastbul:beq *+7:lda #0:sta bullett+spr-4: \
+	endcol: \
+	.)
+COLLIE(4)
+COLLIE(5)
+COLLIE(6)
+COLLIE(7)
+
+	; update chamber indicators
+#define CHAMBUP(x)	\
+	lda #3:ldx bullett+x-4:beq *+4:lda #6:sta colour+bulletl+x-4
+CHAMBUP(4)
+CHAMBUP(5)
+CHAMBUP(6)
+CHAMBUP(7)
+
+	rts
+
+	; move tank
+tank	; check if we're in a turning mode first
+	lda tanktir
+	beq tankk
+	jmp tanktrn
+	
+tankk	lda #idlef
+	sta 54279
+
+	; are we timed out?
+	lda tankill
+	beq tankok	; no
+	; yes, flash and shake dat screen
+	lda 53280
+	eor #8		; toggle between red and pink
+	sta 53280
+	lda 53284
+	eor #10
+	sta 53284
+	lda 54299	; warble tank explosion frequency
+	ora #192	; keep in higher audible range
+	sta 54272
+	and #7
+	ora #24+64	; hit Y scroll
+	sta 53265
+	dec tankill
+	beq tankdp
+	; and spin tank randomly
+	lda 54299
+	and #3
+	jmp tanktsu
+	; no, but we just exited penalty, so turn off everything first
+tankdp	lda #0
+	sta 53280
+	sta 53284
+	lda #128
+	sta 54272
+	sta 54276
+	lda #27+64
+	sta 53265
+	; fall thru
+
+tankok	jsr tkinput
+	and #127
+	eor #127
+	bne tankmov
+	lda #0
+	sta didfire	; fire button debounced
+	rts
+tankmov	; check and debounce fire button but keep value for later comparisons
+	tay
+	and #15
+	tax
+	tya
+	and #16
+	cmp didfire
+	sta didfire
+	beq tankmmv	; if 0=0 or 16=16, don't fire
+	tya
+	and #16
+	beq tankmmv
+	jsr tankfre
+	; fall through
+tankmmv	; if same as current direction, then move immediately
+	txa
+	cmp tankdir
+	bne tanktsu
+	jmp tankm
+tanktsu	; else set up turning animation to new target direction
+	; ignore the fire button
+	; 1 up
+	; 2 down
+	; 4 left
+	; 8 right
+	and #1
+	bne tankmup
+	txa
+	and #2
+	bne tankmdn
+	txa
+	and #4
+	bne tankmlf
+	txa
+	and #8
+	bne tankmrt
+	rts		; could be zero I GUESS
+	; sprite shape rotation is rendered CLOCKWISE
+	; compute target frame
+tankmup	sta tanktir
+	lda #0
+	jmp tankmgo
+tankmdn	sta tanktir
+	lda #6
+	jmp tankmgo
+tankmlf	sta tanktir
+	lda #9
+	jmp tankmgo
+tankmrt	sta tanktir
+	lda #3
+	; fall thru
+tankmgo	; now compute shortest route to get there
+	; degenerate case of somehow we're still going the same direction
+	sta tanktrf
+	cmp trotatf
+	bne tankmgp
+	lda #0
+	sta tanktir	; no rotation required
+	; don't allow a move if we're in penalty
+	ldy tankill
+	beq *+3
+	rts
+	txa		; direction still in x
+	jmp tankm	; treat as a move
+tankmgp	bcc tankmgl
+	; target frame is greater than current frame, go clockwise
+	; EXCEPT if target is 9 and current frame is 0
+	; do first rotation frame now
+	cmp #9
+	bne tankmgq
+	lda trotatf
+	bne tankmgq
+	lda #255
+	sta tanktif
+	bne tanktrn
+tankmgq	lda #1
+	sta tanktif
+	bne tanktrn
+tankmgl	; target frame is less than current frame, go counterclockwise
+	; EXCEPT if target is 0 and current frame is 9
+	; do first rotation frame now
+	cmp #0
+	bne tankmgj
+	lda trotatf
+	cmp #9
+	bne tankmgj
+	lda #1
+	sta tanktif
+	bne tanktrn
+tankmgj	lda #255
+	sta tanktif
+	; fall thru
+
+	; turn tank
+tanktrn
+	lda #turnf
+	sta 54279
+	lda trotatf
+	clc
+	adc tanktif
+	cmp #255
+	beq tanktnn
+	cmp #12
+	bcc tankt2n
+	lda #0
+tankt2n	sta trotatf
+	tax
+	; select correct tread
+	lda treadf
+	clc
+	beq tankt3n
+	ldy #0
+	sty treadf
+	txa
+	adc #SPR(spr_tread)
+	jmp tankt4n
+tankt3n	ldy #1
+	sty treadf
+	txa
+	adc #SPR(spr_tread2)
+tankt4n sta where+1017
+	txa			; add should not set carry
+	adc #SPR(spr_turret)
+	sta where+1018
+	txa
+	adc #SPR(spr_base)
+	sta where+1019
+	cpx tanktrf
+	beq tankt5n
+	rts
+tanktnn	lda #11
+	jmp tankt2n
+tankt5n	; turn is complete
+	lda tanktir
+	sta tankdir
+	lda #0
+	sta tanktir
+	rts
+	
+tankm	; actually move
+	; 1 up
+	; 2 down
+	; 4 left
+	; 8 right
+	; 16 button (should have been handled already)
+	; check movements. no diagonals
+	ldy #movef
+	sty 54279
+tankmm	txa
+	and #1
+	bne tankup
+	txa
+	and #2
+	bne tankdn
+	txa
+	and #4
+	bne tanklf
+	txa
+	and #8
+	bne tankrt
+	jmp tanksht
+	; do movements
+tankdn	lda 53251	; don't move if max
+	cmp #$de
+	bcc *+3
+	rts
+	inc 53251
+	inc 53253
+	inc 53255
+	jmp tanktrd
+tanklf	lda 53250	; don't move if min
+	cmp #22
+	bcs *+3
+	rts
+	dec 53250
+	dec 53252
+	dec 53254
+	jmp tanktrd
+tankrt	lda 53250	; don't move if max
+	cmp #$f8
+	bcc *+3
+	rts
+	inc 53250
+	inc 53252
+	inc 53254
+	jmp tanktrd
+tankup	lda 53251	; don't move if min
+	cmp #$39
+	bcs *+3
+	rts
+	dec 53251
+	dec 53253
+	dec 53255
+	; fall thru
+
+	; check collision and then
+	; animate tank tread
+tanktrd	
+	lda treadf
+	clc
+	bne tankt2d
+	lda #SPR(spr_tread2)
+	adc trotatf
+	sta where+1017
+	lda #1
+	sta treadf
+	rts
+tankt2d	lda #SPR(spr_tread)
+	adc trotatf
+	sta where+1017
+	lda #0
+	sta treadf
+	rts
+tanksht ; XXX
+	rts
+
+tankfre	; allocate a bullet and set it going
+	inc tankfyr
+	bne :+
+	lda #255
+	sta tankfyr
+:
+	; fudge for when we're pointing to the right
+	lda #128
+	sta 54276
+#define ALOBANG(spr) .( : \
+		lda 53269:and #(1<<spr):bne nobang: \
+		lda bullett+spr-4:bne nobang: \
+		lda 53250:sta 53248+spr+spr: \
+		lda 53251:sta 53249+spr+spr: \
+		ldy tankdir:cpy #8:bne *+5:inc 53249+spr+spr: \
+		lda tankfdx,y:sta bulletx+spr-4: \
+		lda tankfdy,y:sta bullety+spr-4: \
+		lda #255:sta bullett+spr-4: \
+		lda #6:sta colour+bulletl+spr-4: \
+		lda #129:sta 54276: \
+		lda 53269:ora #(1<<spr):sta 53269:rts: \
+	nobang: .)
+	ALOBANG(4)
+	ALOBANG(5)
+	ALOBANG(6)
+	ALOBANG(7)
+	; no bullets left, do nothing
+	rts
+
+	; direction table, indexed by direction (1, 2, 4, 8)
+	;        -1- -2-     -4-             -8-
+tankfdx	.byt $55,$00,$00,$55,$ff,$55,$55,$55,$01
+tankfdy .byt $55,$ff,$01,$55,$00,$55,$55,$55,$00
+
+tankcol	; check tank collision here, since we've had enough ticks
+	; this does NOT check for tank explosion, that's in the boom routine
+	lda holdcol
+	and #14
+	beq againp0	; no collision
+	; collision with background prior to bombs, so this is motion
+	; restore to last safe location
+	ldx #0
+aganpl	lda tanksaf,x
+	sta 53250,x
+	inx
+	cpx #6
+	bne aganpl
+	jmp againp1
+againp0	; no collision, make this the new safety point
+	ldx #0
+aganp0l	lda 53250,x
+	sta tanksaf,x
+	inx
+	cpx #6
+	bne aganp0l
+	; fall through
+againp1 lda #0
+	sta holdcol
+	lda 53279	; clear latch
+	rts
+
+; work areas
+holdcol	.byt 0
+boomsiz	.byt 0
+didboom	.byt 0
+didfire	.byt 0
+; how many 4-ticks left before moving down fuel gauge
+burnrat	.byt 0
+; current frame of tank tread
+treadf	.byt 0
+; current frame of rotation of tank
+trotatf	.byt 0
+; current logical direction of tank (direct from joystick)
+tankdir	.byt 1 
+; animation parameters
+; target logical direction of tank (direct from joystick - if 0, not turning)
+tanktir	.byt 0
+; target frame of rotation of tank
+tanktrf	.byt 0
+; increment for frame of rotation of tank (1 or 255)
+tanktif	.byt 0
+; last safe tank location
+tanksaf .dsb 8
+
+; statistics
+totbom	.word 0
+tottree	.word 0
+
+; active bullets (four)
+bulletx	.byt 0, 0, 0, 0
+bullety	.byt 0, 0, 0, 0
+; ticks left before reactivating (0 = ready and available)
+bullett	.byt 0, 0, 0, 0
+; tank timeout for when hit
+tankill	.byt 0
+; ever had a timeout this level
+penlev	.byt 0
+; how many shots taken (saturates)
+tankfyr	.byt 0
+
+end_hibank	;
+
+	SEG($a000)
+.bin 2,0,"ddtank.bmp"
+
+	SEG($c000)
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; initialize
+
+; demo mode
+
+uninitd	; undo changes that initd did (restore screen, etc.)
+	lda #11
+	sta 53265
+:	lda 53265
+	bpl :-
+	sei
+	lda #$2d	; Kernal off but I/O on
+	sta $01
+	ldx #0
+uninitl	lda $e000,x
+	sta $0400,x
+	lda $e400,x
+	sta $d800,x
+	lda $e100,x
+	sta $0500,x
+	lda $e500,x
+	sta $d900,x
+	lda $e200,x
+	sta $0600,x
+	lda $e600,x
+	sta $da00,x
+	lda $e300,x
+	sta $0700,x
+	lda $e700,x
+	sta $db00,x
+	inx
+	bne uninitl
+	lda #$2f
+	sta $01
+	cli
+
+	; restore old game options (seedp and levsegs are regenerated)
+	lda denziti_
+	sta denziti
+	lda triziti_
+	sta triziti
+	lda trails_
+	sta trails
+	lda fastbul_
+	sta fastbul
+	lda burner_
+	sta burner
+	lda glastnk_
+	sta glastnk
+
+	; wait for firebutton to be released
+:	lda 56320
+	cmp #127
+	bne :-
+
+	; go back to title screen
+	jmp title
+
+	; space saved for old options
+denziti_	.byt 0
+triziti_	.byt 0
+trails_		.byt 0
+fastbul_	.byt 0
+burner_		.byt 0
+glastnk_	.byt 0
+
+	; delay on advancing demo IP
+dsmuthi	= 2
+dsmuthf	.byt 0
+dsmuth	.byt 0
+initd	; demo mode
+	lda #11
+	sta 53265
+	lda #151
+	sta 56576
+	; turn off music, if it was running
+	jsr musoff
+	; save screen and colour RAM
+	sei
+	ldx #0
+initdsl	lda $0400,x
+	sta $e000,x
+	lda $d800,x
+	sta $e400,x
+	lda $0500,x
+	sta $e100,x
+	lda $d900,x
+	sta $e500,x
+	lda $0600,x
+	sta $e200,x
+	lda $da00,x
+	sta $e600,x
+	lda $0700,x
+	sta $e300,x
+	lda $db00,x
+	sta $e700,x
+	inx
+	bne initdsl
+	cli
+	; set tkinput to load from memory (restored by title routine)
+	lda #$ea
+	sta tkinpuu
+	; reset instruction pointer
+	lda #$0e
+	sta otzp
+	lda #$a0
+	sta otzp+1
+	lda #dsmuthi
+	sta dsmuth
+	sta dsmuthf
+	; set regular duty parameters and save original contents
+	; (seedp/levsegs recomputed by BASIC so we don't need to save that)
+	; denziti=166 triziti=32 trails=0 burner=40 glastnk=1 fastbul=0
+	lda denziti
+	sta denziti_
+	lda #166
+	sta denziti
+	lda triziti
+	sta triziti_
+	lda #32
+	sta triziti
+	lda trails
+	sta trails_
+	lda fastbul
+	sta fastbul_
+	lda #0
+	sta seedp
+	sta trails
+	sta fastbul
+	sta levsegs
+	sta levsegs+1
+	sta levsegs+2
+	lda #$a8
+	sta seedp+1
+	lda burner
+	sta burner_
+	lda #40
+	sta burner
+	lda glastnk
+	sta glastnk_
+	lda #1
+	sta glastnk
+	; and fall through
+
+initz	; total cold start, including audio (ass-U-me game parameters set)
+	jsr isound
+	; reset fuel count, maintained as sprite 0 Y position
+	lda #(50+(8*fuellr))
+	sta 53249
+	; and reset fuel consumption
+	lda burner
+	sta burnrat
+	; and reset score and bonus count
+	lda #0
+	sta bomscor
+	sta bomscor+1
+	sta bonuses
+	sta bonuses+1
+	sta bonuses+2
+	sta bonuses+3
+	sta bonuses+4
+	sta bonuses+5
+	sta bonuses+6
+
+initc	; warm start, leaving audio on
+	lda #0
+	sta 53280
+	lda #11
+	sta 53265
+	lda #16+10+1	; $0400 screen, $2800 font
+	sta 53272
+	lda #255
+	sta 53370	; shouldn't be on, but make sure SuperCPU is off
+
+	; sprite 0 is set up when we draw the fuel gauge
+	; tank tread is sprite 1
+	; it rotates
+	lda #SPR(spr_tread)
+	sta where+1017
+	; tank turret is sprite 2
+	; it rotates
+	lda #SPR(spr_turret)
+	sta where+1018
+	; tank base is sprite 3 
+	; it rotates
+	lda #SPR(spr_base)
+	sta where+1019
+	; bullets are 4, 5, 6, 7
+	; they don't rotate
+	lda #SPR(spr_shell)
+	sta where+1020
+	sta where+1021
+	sta where+1022
+	sta where+1023
+	lda #tankx
+	sta 53250
+	sta 53252
+	sta 53254
+	sta 53256
+	sta 53258
+	lda #tanky
+	sta 53251
+	sta 53253
+	sta 53255
+	sta 53257
+	sta 53259
+	; put bullets behind foreground, everything else above
+	lda #240
+	sta 53275
+	lda #0
+	sta 53264	; may change for fuel gauge sprite
+	sta 53271
+	sta 53274
+	sta 53276
+	sta 53277
+	sta 53279
+	sta 53291
+	sta 53292
+	sta 53293
+	sta 53294
+	lda #15
+	sta 53287
+	lda #0
+	sta 53288
+	lda #11
+	sta 53289
+	lda #12
+	sta 53290
+	lda #15		; fuel gauge set up separately
+	sta 53269
+	; tank starts out pointing up in default tread
+	lda #0
+	sta treadf
+	sta trotatf
+	sta tanktir
+	lda #1
+	sta tankdir
+	; clear tank and shell timeouts, clear shot counts
+	lda #0
+	sta bullett
+	sta bullett+1
+	sta bullett+2
+	sta bullett+3
+	sta tankill
+	sta penlev
+	sta tankfyr
+	sta hsht
+	jmp nuscrn
+
+	; tank input abstraction
+tkinput	lda 56320
+tkinpuu	rts		; set to nop when in demo mode
+	; stop demo mode on firebutton or any key
+	cmp #111
+	beq tkinpux
+	lda 203
+	cmp #64
+	bne tkinpux
+
+	ldy #0
+	lda (otzp),y
+	and #239	; fire whenever possible
+	dec dsmuth
+	beq *+3
+	rts
+	ora #16		; debounce
+	ldx dsmuthf
+	inx
+	stx dsmuthf
+	stx dsmuth
+	inc otzp
+	ldx otzp
+	cpx #$24
+	beq *+3
+	rts
+	; set fuel gauge to zero and we'll automatically unwind
+tkinpux	ldx #(50-1+(fuellr*8)+fuelout)
+	stx 53249
+	ldx #0
+	stx 198
+	rts
+
+	; helper for high score screen
+hscol	= 10
+hspos0	= 55296+(23*40)
+hshc	.byt hscol
+hshw	.byt 0
+hsht	.byt 0
+highh	ldx #ttixof
+	lda hshc
+	beq highh0
+	ldx #ttixon
+highh0	stx hshw
+	ldx #0
+	stx 162
+highhl	sta hspos0,x
+	inx
+	cpx #40
+	bne highhl
+highhm	lda 56320
+	and #16
+	beq highhc
+	lda 162
+	cmp hshw
+	bcc highhm
+	clc
+	adc hsht		; keep running tally of jiffies
+	sta hsht
+	cmp #210		; automatically advance after end of music
+	bcs highhc
+	lda hshc
+	eor #hscol
+	sta hshc
+	jmp highh
+highhc	rts
+
+	; helper for configuration menu
+	; install blinker IRQ on top of music
+cfcol	= 1
+cfpos	= 55296+(23*40)
+cfhc	.byt cfcol
+cfhw	.byt 0
+cfht	.byt 0
+cfhtt	.byt 0
+configh	; entrypoint start extinguished
+	lda #0
+	sta cfhc
+	sta cfhtt
+	lda #1
+	sta cfht
+	lda #ttixof
+	sta cfhw
+
+	; move some of the BASIC pokes here for size and speed
+	lda #14
+	sta 2040
+	sta 2041
+	sta 2042
+	lda #13
+	sta 2043
+	sta 2044
+	sta 2045
+	sta 2046
+	lda #1
+	sta 53287
+	sta 53288
+	sta 53289
+	lda #7
+	sta 53290
+	sta 53291
+	sta 53292
+	sta 53293
+
+	; and the sprite positioner, for which we need to pull arguments
+	; from BASIC
+	jsr $aefd
+	jsr $ad9e
+	jsr $b1aa	; lb of bx now in y
+	tya
+
+	sta 53254
+	clc
+	adc #16
+	sta 53248
+	adc #32		; + 48
+	sta 53256
+	adc #16		; + 64
+	sta 53250
+	adc #32		; + 96
+	sta 53258
+	adc #16		; + 112
+	sta 53252
+	adc #16		; + 128
+	sta 53260
+
+	jsr $aefd
+	jsr $ad9e
+	jsr $b1aa	; lb of by now in y
+	tya
+
+	sta 53255
+	sta 53257
+	sta 53259
+	sta 53261
+	clc
+	adc #10
+	sta 53249
+	sta 53251
+	sta 53253
+
+	; set up blinker interrupt over music
+	sei
+	lda $0314
+	sta confghj+1
+	lda $0315
+	sta confghj+2
+	lda #<configi
+	sta $0314
+	lda #>configi
+	sta $0315
+	cli
+	rts
+
+	; blue text fader table
+confft0	.byt 1,1,1,3,14,6,14,3
+	; yellow border fader table
+confft1	.byt 7,8,9,7,7,8,9,7
+
+configi	; animate the title
+	; this was distracting so I disabled it
+#if(0)
+	dec cfht
+	bne confghk
+	lda #6			; cycle on every sixth tick
+	sta cfht
+	ldx cfhtt
+	lda confft0,x
+	sta 53287
+	sta 53288
+	sta 53289
+	lda confft1,x
+	sta 53290
+	sta 53291
+	sta 53292
+	sta 53293
+	inx
+	txa
+	and #7
+	sta cfhtt
+#endif
+	; now the text blinker
+confghk	dec cfhw
+	bne confghj
+	lda cfhc
+	eor #cfcol
+	sta cfhc
+	ldx #ttixof
+	cmp #0
+	beq confgh0
+	ldx #ttixon
+confgh0	stx cfhw
+confige	ldx #0
+confghl	sta cfpos,x
+	inx
+	cpx #40
+	bne confghl
+confghj	jmp $fe66
+
+ditdith	; set up dit dit dit for "dot matrix printer"
+	lda #0
+	sta 54272
+	sta 54273
+	sta 54277
+	lda #192
+	sta 54278
+	lda #15
+	sta 54296
+	lda #0
+	sta ditditp
+	lda #0
+	sta ditditb
+
+	sei
+	lda #<ditditi
+	sta $0314
+	lda #>ditditi
+	sta $0315
+	cli
+	rts
+	
+	; buffer for string data
+ditditb	.dsb 30
+	; position in buffer (and temporarily length during copy)
+ditditp	.byt 0
+
+ditdits	; accept a string for the IRQ dit dit dit
+	jsr $aefd
+	jsr $ad9e
+	jsr $b6a3	; a = length, x = lb, y = hb
+	stx lozp
+	sty lozp+1
+	cmp #30
+	bcs *		; buffer overflow
+	sei		; make sure the IRQ doesn't run during the copy
+	sta ditditp
+	cmp #0		; zero length strings are possible
+	bne :+
+	sta ditditb
+	cli
+	rts
+:	ldy #0		; actually copy a non-zero length string
+ditditl	lda (lozp),y
+	sta ditditb,y
+	iny
+	cpy ditditp
+	bne ditditl
+	lda #0
+	sta ditditb,y
+	lda #0		; reset pointer in buffer
+	sta ditditp
+	cli
+	rts
+
+	; make sounds on each jiffy tick
+ditditi	ldx ditditp
+	lda ditditb,x
+	bne ditditj	; is it a zero byte (end of string)?
+	lda #32		; yes, turn off sound and exit
+	sta 54276
+ditditx	jmp $ea31
+ditditj	and #24
+	sta 54273
+	lda #33
+	sta 54276
+	inc ditditp
+	jmp ditditx
+
+	; display scrolling credits, just for fun
+	; credit scrolling speed
+credspd	= 4
+credt	.byt 0			; ticks to next scroll
+credpal	.byt 0			; NTSC adjustment for 60Hz (scroll at ~50Hz)
+credits	jsr musoff
+	jsr muson2		; start music but we'll override the IRQ
+	lda #11
+	sta 53265
+	lda #31
+	sta 53272		; start on $0400
+	lda #0
+	sta 53280
+	sta 53281
+	sta credpal		; reset counts and pointer to credit buffer
+	lda #credspd
+	sta credt
+	lda #<crdata
+	sta lozp
+	lda #>crdata
+	sta lozp+1
+
+	; double buffer between $0400 and $0800 for a very smooth scroll
+	; but that means we have to save the BASIC text somewhere first
+	; save it and clear the screens
+stash2	= $e000
+	ldx #0
+credl0	lda $0800,x
+	sta stash2,x
+	lda $0900,x
+	sta stash2+256,x
+	lda $0a00,x
+	sta stash2+512,x
+	lda $0b00,x
+	sta stash2+768,x
+	lda #32
+	sta $0400,x
+	sta $0500,x
+	sta $0600,x
+	sta $0700,x
+	sta $0800,x
+	sta $0900,x
+	sta $0a00,x
+	sta $0b00,x
+	lda #1
+	sta $d800,x
+	sta $d900,x
+	sta $da00,x
+	sta $db00,x
+	inx
+	bne credl0
+
+	; switch on raster interrupt for smooth scroll
+	sei
+	; interrupt near bottom of screen
+	lda #255
+	sta 53266
+	; 24 row display, pulled all the way down
+	lda #16+7
+	sta 53265
+	; raster IRQs on and nothing else
+	lda #$7f
+	sta $dc0d
+	lda #1
+	sta 53274
+	lda #<credm
+	sta $0314
+	lda #>credm
+	sta $0315
+	clc
+	cli
+	bcc *			; wait for IRQ
+
+	; main loop (IRQ fired)
+credm	lda #15
+	sta $d019		; ack the IRQ
+;sta $d020
+	lda 53265
+	tax			; save for a moment
+	; check firebutton or keyboard
+	lda 56320
+	and #16
+	bne credm0
+	jmp credxit
+	; new frame, not exiting
+	; slow NTSC to approximately 50Hz
+credm0	lda $02a6
+	bne crednpa
+	inc credpal
+	lda credpal
+	cmp #6
+	bcc crednpa
+	lda #0
+	sta credpal
+	jmp credixx
+crednpa	dec credt		; wait until scroll time
+	bne credix
+	; time to scroll
+	; 7-3, just move the fine position
+	; 2, do part of the copy (takes too long on PAL to do on ones)
+	; 1, do the rest of the copy
+	; 0, flip the page and reset
+	lda #credspd
+	sta credt
+	txa
+	and #7			; what stage?
+	beq credflp		; page flip
+	cmp #2
+	beq credcya		; part copy
+	cmp #1
+	beq credcor		; rest copy and stamp
+credmsc	sec
+	sbc #1			; fine scroll up by 1 and wait again
+	ora #16
+	sta 53265
+credix	jsr valkmu+3
+credixx	lda #255		; prime raster interrupt again
+	sta 53266
+	lda 53265
+	and #127
+	sta 53265
+	lda #1
+	sta 53274
+//lda #0:sta $d020
+	pla			; and unwind stack
+	tay
+	pla
+	tax
+	pla
+	rti
+
+	; switch screens
+credflp	
+//lda #2:sta $d020
+	lda 53272
+	eor #48			; flip buffer
+	sta 53272
+	lda #16+7
+	sta 53265
+	jmp credix		; and go again
+
+	; do part of the coarse scroll to prepare for flipping buffer
+credcya	ldx #0
+//ldy #1:sta 53280
+	lda #17
+	sta 53265		; do fine scroll NOW
+	lda 53272
+	cmp #31
+	bne credc8		; screen is currently on $0800
+#define CREDX(base,new)	.( : \
+	loop: \
+		lda base+512+40,x:sta new+512,x: \
+		lda base+768+40,x:sta new+768,x: \
+		inx:bne loop: \
+	jmp credix: \
+	.)
+credc4	CREDX(1024,2048)	; screen is currently on $0400
+credc8	CREDX(2048,1024)
+
+	; do the rest of coarse scroll and then do new text
+credcor	ldx #0
+//ldy #1:sty 53280
+	lda #16
+	sta 53265		; do fine scroll NOW
+	lda 53272
+	cmp #31
+	bne cred8		; screen is currently on $0800
+#undef CREDX
+#define CREDX(base,new)	.( : \
+	loop: \
+		lda base+40,x:sta new,x: \
+		lda base+256+40,x:sta new+256,x: \
+		inx:bne loop: \
+		lda #<(new+960):sta lozp+2: \
+		lda #>(new+960):sta lozp+3: \
+	.)
+cred4	CREDX(1024,2048)	; screen is currently on $0400
+	jmp credstr
+cred8	CREDX(2048,1024)
+credstr	; clear new line
+	lda #32
+	ldy #40
+:	dey
+	sta (lozp+2),y
+	cpy #0
+	bne :-
+	; copy new line
+credstn	ldy #0
+	lda (lozp),y
+	cmp #$fd		; loop over
+	bne :+
+	lda #<crdata
+	sta lozp
+	lda #>crdata
+	sta lozp+1
+	jmp credix		; still scroll when resetting pointer
+:	cmp #$fe
+	beq credctr
+	; copy line
+credstc lda (lozp),y
+	cmp #$ff
+	beq credstd
+	sta (lozp+2),y
+	iny
+	bne credstc
+credstd	iny			; to skip end of line
+	tya			; add final Y to pointer to advance
+	clc
+	adc lozp
+	sta lozp
+	lda lozp+1
+	adc #0
+	sta lozp+1
+	jmp credix
+
+	; compute centred position
+credctr ldy #0
+:	iny			; skip centre metacharacter
+	; get length of string by walking it forward
+	lda (lozp),y
+	cmp #$ff
+	bne :-
+	dey			; don't include line ending
+	sty lozp+4		; length now in y, store for calculations
+	; compute adjustment needed for centre and adjust dest pointer
+	lda #39			; not 40, because we started with y=1
+	sec
+	sbc lozp+4		; 40-length(string)
+	lsr			; divided by 2
+	clc
+	adc lozp+2		; add to destination pointer
+	sta lozp+2
+	lda lozp+3
+	adc #0
+	sta lozp+3
+	ldy #1
+	jmp credstc		; now do copy
+
+	; unwind IRQ and exit
+credxit	sei
+	lda #11
+	sta 53265
+	; kill raster IRQ, turn back on Timer A IRQs
+	lda #0
+	sta 53274
+	lda #$ff
+	sta $dc0d
+	; pull everything off the stack
+	pla	; Y
+	pla	; X
+	pla	; A
+	pla	; P
+	pla	; return address
+	pla
+	; restore BASIC text
+	lda #$2c
+	sta $01
+	ldx #0
+credlz	lda stash2,x
+	sta $0800,x
+	lda stash2+256,x
+	sta $0900,x
+	lda stash2+512,x
+	sta $0a00,x
+	lda stash2+768,x
+	sta $0b00,x
+	inx
+	bne credlz
+	lda #$2f
+	sta $01
+
+	jsr musoff		; reset and restore interrupts
+	lda #31
+	sta 53272
+	lda #147
+	jmp $ffd2		; clear $0400 on exit
+				; screen is still off
+
+	; credits strings follow, in PETSCREEN format, delimited by $ff
+	; $fe as first character says should be centred
+	; $fd as first character says start over
+crdata
+	;          12345678911
+	.asc $fe, "OBLAST v1.0", $ff
+	.asc $fe
+	.dsb 11, 99
+	.asc $ff, $ff
+	.asc $fe, "a game by", $ff
+	.asc $fe, "Cameron Kaiser", $ff
+	.dsb 24, $ff
+	.asc $fe, "executive producer", $ff
+	.asc $fe, "Cameron Kaiser", $ff
+	.dsb 12, $ff
+	.asc $fe, "written and directed by", $ff
+	.asc $fe, "Cameron Kaiser", $ff
+	.dsb 5, $ff
+	.asc $fe, "music by", $ff
+	.asc $fe, "Cameron Kaiser", $ff
+	.dsb 3, $ff
+	.asc $fe, "director of photography", $ff
+	.asc $fe, "Cameron Kaiser", $ff, $ff
+	.asc $fe, "visual effects supervisor", $ff
+	.asc $fe, "Cameron Kaiser", $ff, $ff
+
+;123456789112345678921234567893123456789
+	.asc \
+" costume designer  CAMERON KAISER", $ff, \
+"stunt coordinator  CAMERON KAISER", $ff, \
+"         catering  CAMERON KAISER", $ff, \
+"    on-site medic  CAMERON KAISER", $ff, \
+"  game consultant  CAMERON KAISER", $ff, \
+"         best boy  CAMERON KAISER", $ff, \
+"         best man  CAMERON BEAN", $ff, \
+"1st unit director  CAMERON KAISER", $ff, \
+"2nd unit director  CAMERON KAISER", $ff, \
+"3rd unit director  CAMERON KAISER", $ff, \
+"     tank cuddler  CAMERON KAISER", $ff, \
+"   makeup effects  CAMERON KAISER", $ff, \
+"   title sequence  CAMERON KAISER", $ff, \
+"      end credits  CAMERON KAISER", $ff, \
+"       miniatures  CAMERON KAISER", $ff, \
+" indulgent smiles  JAYNE KAISER", $ff, \
+"     foley artist  CAMERON KAISER", $ff, \
+"         key grip  CAMERON KAISER", $ff, \
+"     focus puller  CAMERON KAISER", $ff, \
+"      prop master  CAMERON KAISER", $ff, \
+"    script doctor  CAMERON KAISER", $ff, \
+"    doctor doctor  CAMERON KAISER", $ff, \
+"      set dresser  CAMERON KAISER", $ff, \
+"     hair stylist  CAMERON KAISER", $ff, \
+"standby plasterer  CAMERON KAISER", $ff, \
+"tank choreography  CAMERON KAISER", $ff, \
+"    boom operator  CAMERON KAISER", $ff, \
+	$ff
+
+	.asc $fe, "fourth Prime Minister", $ff
+	.asc $fe, "of Australia", $ff
+	.asc $fe, "SIR GEORGE HOUSTON REID", $ff, $ff
+	.asc $fe, "old vintage computing", $ff
+	.asc $fe, "research parliament", $ff
+	.asc $fe, "CAMERON KAISER  CAMERON KAISER", $ff
+	.asc $fe, "CAMERON KAISER    CAMERON KAISER", $ff
+	.asc $fe, "CAMERON KAISER", $ff, $ff, $ff
+
+	.asc $fe, "these credits don't take up", $ff
+	.asc $fe, "nearly as much memory", $ff
+	.asc $fe, "as you'd think", $ff, $ff, $ff
+
+	.asc $fe, "based on", $ff, $fe, "Blasto", $ff
+	.asc $fe, "by Lane Hauck and Bill Blewitt", $ff
+	.asc $fe, 120, 121, "1978 Gremlin Industries", $ff
+	.asc $ff, $fe, "and", $ff, $ff
+	.asc $fe, "Blasto for the TI-99/4A", $ff
+	.asc $fe, "by Elaine Henshon, Bob Harris", $ff
+	.asc $fe, "and Kevin Kenney", $ff
+	.asc $fe, 120, 121, "1980 Milton Bradley Co.", $ff
+	.asc $fe, 120, 121, "1981 Texas Instruments", $ff, $ff, $ff
+
+	.asc $fe, "MUSIC", $ff, $fe, 99, 99, 99, 99, 99, $ff, $ff
+
+	.asc $fe, "arranged for SID by", $ff,
+	.asc $fe, "Cameron Kaiser", $ff
+	.asc $fe, "with VoiceTracker", $ff, $ff
+
+	.asc $fe, 34, "Ride of the Valkyries", 34, $ff
+	.asc $fe, "by Richard Wagner", $ff, $ff
+
+	.asc $fe, "TI Blasto Title Music", $ff
+	.asc $fe, "interpolating", $ff
+	.asc $fe, 34, "When Johnny Comes Marching Home", 34, $ff
+	.asc $fe, "(Roud 6673)", $ff, $fe, "and", $ff
+	.asc $fe, "TI Blasto Game Over Music", $ff, $ff
+
+	.asc $fe, "soundtrack on 5.25", 34, " floppy disk", $ff, $ff, $ff, $ff
+
+	.asc $fe, 120, 121, "2025 Cameron Kaiser.", $ff
+	.asc $fe, "All rights reserved.", $ff, $ff
+
+	.asc $fe, "This game is freeware.", $ff
+                  ;123456789112345678921234567893123456789
+	.asc $fe, "You may copy and play for free under", $ff
+	.asc $fe, "the Floodgap Free Software License.", $ff, $ff
+	.asc $fe, "If you want to chip in, visit", $ff
+	.asc $fe, "ko-fi.com/classichasclass", $ff
+	.asc $fe, "or", $ff
+	.asc $fe, "github.com/classilla/oblast", $ff, $ff, $ff, $ff
+
+	.asc $fe, "(don't blow up trees in real life)", $ff
+	.asc $fe, "press fire button to exit", $ff
+
+	; end
+	.dsb 25, $ff
+	.asc $fd
