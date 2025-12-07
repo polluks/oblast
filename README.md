@@ -36,6 +36,8 @@ While your tank can go anywhere on the playfield, driving over bombs or trees wi
 
 When your fuel runs out, the game will tally your final score. You receive one point for each bomb detonated (either by shooting it directly or destroying it in a chain reaction). You can also receive a special bonus of 1,000 points for triggering one of up to seven secret conditions on each screen you complete. You can receive multiple special bonuses on a single screen. If you beat the high score, you win an on-screen champion "medal." Congratulations!
 
+If you want to quit a game early, press the Control, Shift and Commodore keys together at once, and the game will end immediately and compute your score.
+
 After you have completed at least one game, if you want to play again with the same settings, just press the fire button on the title screen instead of F1 and it will "quick start" into a new game right away. Otherwise, you can press F1 for different options.
 
 Game modes F5 and F7 play differently. F5 "More Like Classic Blasto" generates screens more like the classic Blasto game in the arcade and on the TI 99/4A using a similar density of bombs and obstacles. In this mode, your shells recycle right away as soon as they hit something, and the game clears trails for you to move around in, but play is otherwise the same. Some of the special bonuses are disabled in this mode.
@@ -63,6 +65,8 @@ Instead of pressing F1, F3, F5 or F7 at the main screen, press RETURN. This will
 You can then press RETURN to play when you have the options you want. If you want to start with one of the defaults and then tweak it, press F1, F3, F5 or F7, and the values for that particular default (except starting level) are loaded into the settings. Changing them on this screen does not change them permanently.
 
 ## Hints and tips
+
+Unlike the original Blasto, you can fire multiple times and in multiple directions.
 
 Your shells are much faster than you are. It is generally quicker to aim from a distance and fire than to move the tank up close -- assuming your aim is good.
 
@@ -102,3 +106,7 @@ I essentially consider this game to be feature-complete. Feature requests, even 
 Although you can submit bug reports, and (if provided) pull requests for suggested fixes, bugs (acknowledged, unreproducible or otherwise) may or may not ever be fixed. Submission of a pull request is considered an implicit and unconditional release of all rights to the submitted code to me.
 
 Do not submit bug reports to change to your favourite assembler, or change the code style, or other items of personal preference. These changes, even if accompanied by a pull request, will be ignored or deleted. Please make such changes in your own fork. 
+
+## Thanks for playing
+
+Oblast is free to play and freely distributable. But, if you've enjoyed it, [buy me a coffee/Mr Pibb](https://ko-fi.com/classichasclass).
